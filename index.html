@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Gesture Spotify Player — Robust</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<style>
+  :root{--green:#1db954;--bg:#191414}
+  body{
+    margin:0; font-family: "Segoe UI", Roboto, sans-serif;
+    height:100vh; display:flex; align-items:center; justify-content:center;
+    background: linear-gradient(135deg,var(--green),var(--bg));
+    color:#fff;
+  }
+  .card{
+    width:720px; background:rgba(0,0,0,0.6); border-radius:16px; padding:18px;
+    box-shadow:0 10px 40px rgba(0,0,0,0.6); display:flex; gap:18px; align-items:center;
+  }
+  #canvas{ border-radius:10px; background:#000; width:480px; height:360px; }
+  .controls{ flex:1; display:flex; flex-direction:column; gap:12px; }
+  .title{ font-size:20px; font-weight:600; }
+  .track{ font-size:14px; color:#ddd; }
+  .gesture{ font-size:18px; font-weight:700; color:yellow; }
+  .vol-bar{ width:100%; height:10px; background:rgba(255,255,255,0.12); border-radius:6px; overflow:hidden; }
+  .vol-fill{ height:100%; width:50%; background:var(--green); transition:width 0.12s linear; }
+  audio{ width:100%; margin-top:6px; background:transparent; }
+  .hint{ font-size:12px; color:#ccc; }
+  .small{ font-size:12px; color:#bbb; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <canvas id="canvas" width="480" height="360"></canvas>
+
+    <div class="controls">
+      <div class="title">🎶 手势音乐播放器</div>
+      <div class="track" id="trackName">Track: -</div>
+      <div class="gesture" id="gestureName">检测中…</div>
+
+      <div>
+        <div class="small">音量</div>
+        <div class="vol-bar"><div id="volFill" class="vol-fill"></div></div>
+      </div>
+
+      <audio id="player" controls></audio>
+      <div class="hint">手势：🖐 播放 / ✊ 暂停 / 👉 下一首 / 👈 上一首 / 👌 音量+ /  👇音量-</div>
+    </div>
+  </div>
+
+<script>
+/* ------------ 配置与资源 ------------ */
+const audioFiles = ["music1.mp3","music2.mp3","music3.mp3","music4.mp3","music5.mp3","music6.mp3" ,"music7.mp3","music8.mp3","music9.mp3","music10.mp3" ]; // 按需替换
+let currentTrack = 0;
+
+const player = document.getElementById('player');
+player.src = audioFiles[currentTrack];
+player.volume = 0.5;
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const volFill = document.getElementById('volFill');
+const trackName = document.getElementById('trackName');
+const gestureNameEl = document.getElementById('gestureName');
+
+trackName.innerText = `Track: ${audioFiles[currentTrack]}`;
+
+/* ------------ 平滑与防抖参数 ------------ */
+const SMOOTH_ALPHA = 0.6;         // EMA 平滑系数 (0..1) - 越大平滑程度越低
+const STABLE_FRAMES = 6;         // 连续 N 帧才确认手势
+const COOLDOWN_MS = 900;         // 触发后冷却 ms
+const DIST_NORMALIZE_REF = [5,9]; // 用 finger_mcp(5) 与 wrist(0) 距离作为尺度参考时使用（index mcp 为 5）
+let lastTriggerAt = 0;
+let lastStableGesture = null;
+let stableCount = 0;
+
+/* 上一帧平滑关键点 */
+let smoothLandmarks = null;
+
+/* 生成 video 元素（隐藏） + MediaPipe Hands 初始化 */
+const video = document.createElement('video'); video.style.display='none';
+document.body.appendChild(video);
+
+const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:0.7,minTrackingConfidence:0.7});
+hands.onResults(onResults);
+
+const camera = new Camera(video, { onFrame: async ()=>{ await hands.send({image: video}); }, width:640, height:480 });
+camera.start();
+
+/* ------------ 实用函数 ------------ */
+function calcDist(a,b){
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+function ema(prev, curr, alpha){
+  if(!prev) return curr.map(p=>({x:p.x,y:p.y,z:p.z||0}));
+  return curr.map((p,i)=>({
+    x: alpha * p.x + (1-alpha)*prev[i].x,
+    y: alpha * p.y + (1-alpha)*prev[i].y,
+    z: alpha * (p.z||0) + (1-alpha)*(prev[i].z||0)
+  }));
+}
+/* 归一化距离（按手掌大小）*/
+function normalizedDist(a,b,landmarks){
+  // 参考尺度： wrist(0) <-> middle_finger_mcp(9) 或 index_mcp(5)
+  const ref = calcDist(landmarks[0], landmarks[9] || landmarks[5]);
+  if(ref === 0) return calcDist(a,b);
+  return calcDist(a,b) / ref;
+}
+
+/* 判定各手指是否伸直（基于 tip vs pip 纵向位置）*/
+function fingerExtended(landmarks, tipIdx, pipIdx){
+  // 注意：画面 y 向下增大 → tip.y < pip.y 表示“向上/伸直”
+  return landmarks[tipIdx].y < landmarks[pipIdx].y;
+}
+
+/* 更稳的手势判定：返回字符串或 null */
+function detectGestureMostStable(lm){
+  // lm: 21 landmarks normalized
+  // 用归一化距离与伸直/弯曲判断
+  // 指尖索引：thumb tip 4, index tip 8, middle tip 12, ring 16, pinky 20
+  const thumbTip = lm[4], indexTip = lm[8], middleTip = lm[12], ringTip = lm[16], pinkyTip = lm[20];
+  const indexPip = lm[6], middlePip = lm[10], ringPip = lm[14], pinkyPip = lm[18], indexMcp = lm[5];
+
+  // 判断伸直的手指数
+  const idxExt = fingerExtended(lm,8,6);
+  const midExt = fingerExtended(lm,12,10);
+  const ringExt = fingerExtended(lm,16,14);
+  const pinkyExt = fingerExtended(lm,20,18);
+  // 拇指特殊：判断 thumb tip 与 index mcp 的相对位置
+  const thumbIndexDist = normalizedDist(thumbTip,indexMcp,lm);
+
+  // 规则：Open hand = 多数手指伸直
+  const extendedCount = [idxExt, midExt, ringExt, pinkyExt].filter(Boolean).length;
+
+  // Fist: 大部分指尖比对应 pip 更低（y 大）
+  const isFist = (!idxExt && !midExt && !ringExt && !pinkyExt);
+
+  if (isFist) return "Closed_Fist";
+  if (extendedCount >= 4) return "Open_Palm";
+
+  // Pointing right/left: index extended, 其他弯曲，判断 index tip 相对 wrist x
+  if (idxExt && !midExt && !ringExt && !pinkyExt) {
+    // index tip 与 index mcp x 的比较判断左右 （坐标系：0 左, 1 右）
+    const pointingRight = indexTip.x > lm[5].x; // 右手朝向画面右侧
+    if (pointingRight) return "Pointing_Right";
+    else return "Pointing_Left";
+  }
+
+  // Victory: index & middle extended, others not
+  if (idxExt && midExt && !ringExt && !pinkyExt) return "Victory";
+
+  // Thumb up/down: 拇指与手腕方向比较 (检查 thumbTip.y 与 wrist.y)
+  if (thumbIndexDist > 0.25) { // 拇指与掌心距离很大 -> 可能伸出拇指
+    // 拇指相较于 wrist 的纵向位置判断 up/down
+    if (thumbTip.y < lm[0].y - 0.03) return "OK gesture"; // 高于手腕
+    if (thumbTip.y > lm[0].y + 0.03) return "Index Finger Down";
+  }
+
+  // OK / pinch: index 与 thumb 接近
+  const idxThumbDist = normalizedDist(indexTip, thumbTip, lm);
+  if (idxThumbDist < 0.12) return "Pinch_OK";
+
+  // ILoveYou: thumb + index + pinky extended pattern (简化)
+  if ( (thumbIndexDist > 0.18) && idxExt && !midExt && !ringExt && pinkyExt ) return "ILoveYou";
+
+  return null;
+}
+
+/* 防抖与触发：只有连续 STABLE_FRAMES 帧都检测为同一手势才触发，并有 cooldown */
+async function processDetectedGesture(gesture){
+  const now = Date.now();
+  if(gesture && gesture === lastStableGesture){
+    stableCount = Math.min(stableCount + 1, STABLE_FRAMES + 5);
+  } else if (gesture && gesture !== lastStableGesture) {
+    lastStableGesture = gesture;
+    stableCount = 1;
+  } else {
+    // gesture === null
+    lastStableGesture = null;
+    stableCount = 0;
+  }
+
+  if (lastStableGesture && stableCount >= STABLE_FRAMES && (now - lastTriggerAt) > COOLDOWN_MS) {
+    // 触发动作
+    lastTriggerAt = now;
+    triggerActionForGesture(lastStableGesture);
+  }
+}
+
+/* 触发手势对应的动作（音量或切歌）*/
+function triggerActionForGesture(name){
+  gestureNameEl.innerText = name;
+  switch(name){
+    case "Open_Palm":
+      if (player.paused) player.play();
+      break;
+    case "Closed_Fist":
+      if (!player.paused) player.pause();
+      break;
+    case "Victory":
+      nextTrack();
+      break;
+    case "Pointing_Right":
+      nextTrack();
+      break;
+    case "Pointing_Left":
+      prevTrack();
+      break;
+    case "OK gesture":
+      setVolume(Math.min(1, player.volume + 0.08)); // 一次性微增
+      break;
+    case "Index Finger Down":
+      setVolume(Math.max(0, player.volume - 0.08));
+      break;
+    case "Pinch_OK":
+      // 暂定短按切换播放/暂停
+      if (player.paused) player.play(); else player.pause();
+      break;
+    case "ILoveYou":
+      player.loop = !player.loop;
+      break;
+    default:
+      break;
+  }
+  // 更新 UI 音量条与 track 名
+  volFill.style.width = `${Math.round(player.volume*100)}%`;
+  trackName.innerText = `Track: ${audioFiles[currentTrack]}`;
+}
+
+/* 平滑设置音量（更平滑）*/
+function setVolume(v){
+  // 线性插值一步到位，UI 通过 CSS transition 平滑
+  player.volume = Math.max(0, Math.min(1, v));
+  volFill.style.width = `${Math.round(player.volume*100)}%`;
+}
+
+function nextTrack(){
+  currentTrack = (currentTrack + 1) % audioFiles.length;
+  player.src = audioFiles[currentTrack];
+  player.play();
+  trackName.innerText = `Track: ${audioFiles[currentTrack]}`;
+}
+function prevTrack(){
+  currentTrack = (currentTrack - 1 + audioFiles.length) % audioFiles.length;
+  player.src = audioFiles[currentTrack];
+  player.play();
+  trackName.innerText = `Track: ${audioFiles[currentTrack]}`;
+}
+
+/* ------------ onResults 回调：来自 MediaPipe Hands ------------ */
+function onResults(results){
+  ctx.save();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0){
+    // 取第一个手
+    let landmarks = results.multiHandLandmarks[0];
+
+    // 将 landmarks 规范化为对象数组 {x,y,z}
+    // apply EMA smoothing
+    smoothLandmarks = ema(smoothLandmarks, landmarks, SMOOTH_ALPHA);
+    const lm = smoothLandmarks;
+
+    // 绘制
+    drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: '#1db954', lineWidth: 2});
+    drawLandmarks(ctx, lm, {color: '#fffd82', lineWidth: 1});
+
+    // 计算稳定手势并处理防抖/触发
+    const detected = detectGestureMostStable(lm);
+    processDetectedGesture(detected);
+  } else {
+    // 无手时清空稳定
+    lastStableGesture = null;
+    stableCount = 0;
+    gestureNameEl.innerText = "No hand";
+  }
+  ctx.restore();
+}
+
+/* 启动摄像头（MediaPipe Camera util 已经封装） - camera.start() 已在上面调用 */
+
+/* 初始化音量条显示 */
+volFill.style.width = `${Math.round(player.volume*100)}%`;
+
+</script>
+
+<head>
+  <meta charset="UTF-8">
+  <title>底部居中名字</title>
+  <style>
+    .footer-name {
+      position: fixed;      /* 固定在屏幕底部 */
+      bottom: 10px;         /* 距离底部 10px */
+      left: 50%;            /* 水平居中 */
+      transform: translateX(-50%);
+      font-size: 20px;
+      color: #333;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 底部名字 -->
+  <div class="footer-name">
+    黄涛， 2025-09-17
+  </div>
+
+</body>
+</html>
